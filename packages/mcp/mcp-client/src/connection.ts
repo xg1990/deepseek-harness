@@ -15,7 +15,7 @@
  * @module
  */
 
-import { Client } from '@modelcontextprotocol/client'
+import { Client, SdkErrorCode, SdkHttpError, StreamableHTTPClientTransport, type Transport } from '@modelcontextprotocol/client'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 import { assertNever, deepEqualJson, type JsonValue } from '@deepseek-ai/dsh-util-values'
@@ -117,6 +117,21 @@ export interface ConnectionHandle extends ServerContext {
    * the status cell and blocks replacement.
    */
   dispose(): Promise<void>
+}
+
+/**
+ * Whether a failed request reports a session the server no longer knows: HTTP 404 on a POST made while
+ * the transport holds a session ID. The client then starts a new session with an initialize request that
+ * carries no ID (MCP Streamable HTTP, session management). A 404 on the GET stream does not count: a server
+ * without SSE may answer GET with 404 instead of 405, and reconnecting would repeat indefinitely.
+ * @param error - failure delivered to `Client.onerror`.
+ * @param transport - the generation's transport; it reports its session ID after initialize.
+ * @returns true when the failure reports a lost session.
+ */
+function isSessionLost(error: unknown, transport: Transport | undefined): boolean {
+  return error instanceof SdkHttpError && error.status === 404
+    && error.code !== SdkErrorCode.ClientHttpFailedToOpenStream
+    && transport instanceof StreamableHTTPClientTransport && transport.sessionId !== undefined
 }
 
 /**
@@ -330,7 +345,13 @@ export function startConnection(
     client.onclose = () => {
       if (record.connectedAt !== undefined) lost(record, 'connection closed')
     }
-    if (oauth !== undefined) client.onerror = (error) => {
+    client.onerror = (error) => {
+      if (record.connectedAt !== undefined && isSessionLost(error, client.transport)) {
+        // Mark the generation lost after the failing request settles, so its caller gets the 404 rather than the closure reason.
+        setTimeout(() => { lost(record, diagnostic(error, 'session')) }, 0)
+        return
+      }
+      if (oauth === undefined) return
       const failure = oauthFailure(error)
       if (failure === undefined) return
       // A committed grant replacement fails this generation's later requests with `binding` before the
